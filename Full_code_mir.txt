@@ -1,0 +1,173 @@
+import pandas as pd
+from hdbcli import dbapi
+import pyodbc
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+MAX_RETRIES = 3
+MAX_WORKERS = 5
+
+# change password after use
+HANA_CONFIG = {
+    "address": "13b7c15d-848f-40b5-9259-c9c36ab85f56.hna1.prod-eu10.hanacloud.ondemand.com",
+    "port": 443,
+    "user": "GE327773",
+    "password": "Ob8yQGHzso1!",
+    "encrypt": "true",
+    "sslValidateCertificate": "false"
+}
+
+SQL_CONFIG = {
+    "conn_str": (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "SERVER=localhost;"
+        "DATABASE=SAP_P2P;"
+        "Trusted_Connection=yes;"
+    )
+}
+
+# -----------------------------
+# CONNECTIONS
+# -----------------------------
+def get_hana_conn():
+    return dbapi.connect(**HANA_CONFIG)
+
+def get_sql_conn():
+    return pyodbc.connect(SQL_CONFIG["conn_str"])
+
+# -----------------------------
+# GET CONTROL TABLE
+# -----------------------------
+def get_enabled_tables():
+    conn = get_sql_conn()
+
+    query = """
+    SELECT DB_NAME, SCHEMA_NAME, TABLE_NAME
+    FROM TABLE_CONTROL
+    WHERE ENABLE_FLAG = 'Y'
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# -----------------------------
+# FETCH DATA FROM HANA
+# -----------------------------
+def fetch_hana_data(conn, schema, table):
+    query = f'SELECT * FROM "{schema}"."{table}"'
+    return pd.read_sql(query, conn)
+
+# -----------------------------
+# CREATE TARGET TABLE
+# -----------------------------
+def create_table_sqlserver(conn, table, df):
+    cursor = conn.cursor()
+
+    cursor.execute(f"IF OBJECT_ID('{table}', 'U') IS NOT NULL DROP TABLE {table}")
+
+    cols = [f"[{col}] NVARCHAR(MAX)" for col in df.columns]
+    create_sql = f"CREATE TABLE {table} ({','.join(cols)})"
+
+    cursor.execute(create_sql)
+    conn.commit()
+    cursor.close()
+
+# -----------------------------
+# LOAD DATA
+# -----------------------------
+def load_data(conn, table, df):
+    cursor = conn.cursor()
+
+    placeholders = ",".join(["?"] * len(df.columns))
+    insert_sql = f"INSERT INTO {table} VALUES ({placeholders})"
+
+    cursor.fast_executemany = True
+    cursor.executemany(insert_sql, df.values.tolist())
+
+    conn.commit()
+    cursor.close()
+
+# -----------------------------
+# LOG SUCCESS
+# -----------------------------
+def log_success(conn, table, df):
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO ETL_LOG (TABLE_NAME, ROW_COUNT, COLUMN_COUNT, STATUS)
+        VALUES (?, ?, ?, ?)
+    """, (table, len(df), len(df.columns), "SUCCESS"))
+
+    conn.commit()
+    cursor.close()
+
+# -----------------------------
+# LOG ERROR
+# -----------------------------
+def log_error(conn, table, error, retry):
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO ERROR_LOG (TABLE_NAME, ERROR_MESSAGE, RETRY_COUNT)
+        VALUES (?, ?, ?)
+    """, (table, str(error), retry))
+
+    conn.commit()
+    cursor.close()
+
+# -----------------------------
+# PROCESS TABLE
+# -----------------------------
+def process_table(row):
+    schema = row["SCHEMA_NAME"]
+    table = row["TABLE_NAME"]
+
+    hana_conn = get_hana_conn()
+    sql_conn = get_sql_conn()
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"Processing {table} | Attempt {attempt}")
+
+            df = fetch_hana_data(hana_conn, schema, table)
+
+            create_table_sqlserver(sql_conn, table, df)
+            load_data(sql_conn, table, df)
+
+            log_success(sql_conn, table, df)
+
+            print(f"Success: {table}")
+            break
+
+        except Exception as e:
+            print(f"Error: {table} | {e}")
+
+            log_error(sql_conn, table, e, attempt)
+
+            if attempt < MAX_RETRIES:
+                time.sleep(2)
+            else:
+                print(f"Failed: {table}")
+
+    hana_conn.close()
+    sql_conn.close()
+
+# -----------------------------
+# MAIN PIPELINE
+# -----------------------------
+def run_pipeline():
+    tables_df = get_enabled_tables()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(process_table, row) for _, row in tables_df.iterrows()]
+
+        for future in as_completed(futures):
+            future.result()
+
+    print("Pipeline Completed")
+
+
+#RUN
+run_pipeline()
